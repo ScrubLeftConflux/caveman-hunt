@@ -37,20 +37,50 @@ import { Settings, Play, Send, ListOrdered, Trash2, Users } from "lucide-react";
 
 // -------------------- Bus (BroadcastChannel + storage fallback) --------------------
 
-const mkBus = (code) => {
+const mkBus = (code, relayUrl) => {
   const chanName = `caveman-qte-${code}`;
+  const listeners = new Set();
+
+  // 1) Optional WebSocket relay for cross-device
+  if (relayUrl && /^wss?:\/\//i.test(relayUrl)) {
+    let ws = null;
+    let shouldReconnect = true;
+    let backoff = 500;
+    const connect = () => {
+      try { ws = new WebSocket(`${relayUrl}?room=${encodeURIComponent(chanName)}`); } catch { ws = null; }
+      if (!ws) return;
+      ws.onopen = () => { backoff = 500; };
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          const ev = msg && (msg.payload || msg);
+          if (!msg.room || msg.room === chanName) listeners.forEach((l) => l(ev));
+        } catch {}
+      };
+      ws.onclose = () => { if (!shouldReconnect) return; setTimeout(connect, Math.min(backoff, 5000)); backoff *= 1.5; };
+      ws.onerror = () => { try { ws.close(); } catch {} };
+    };
+    connect();
+    return {
+      post(ev) { try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ room: chanName, payload: ev })); } catch {} },
+      on(cb) { listeners.add(cb); return () => listeners.delete(cb); },
+      destroy() { shouldReconnect = false; try { ws?.close(); } catch {} },
+    };
+  }
+
+  // 2) Same-browser fallback: BroadcastChannel + localStorage
   /** @type {BroadcastChannel|undefined} */
   let ch;
   try { ch = new BroadcastChannel(chanName); } catch {}
   const storageKey = `${chanName}-fallback`;
-  /** @type {Set<(ev:any)=>void>} */
-  const listeners = new Set();
-
-  const onStorage = (e) => {
-    if (e.key === storageKey && e.newValue) {
-      try { const ev = JSON.parse(e.newValue); listeners.forEach((l) => l(ev)); } catch {}
-    }
+  const onStorage = (e) => { if (e.key === storageKey && e.newValue) { try { const ev = JSON.parse(e.newValue); listeners.forEach((l) => l(ev)); } catch {} } };
+  if (typeof window !== "undefined") window.addEventListener("storage", onStorage);
+  return {
+    post(ev) { ch?.postMessage(ev); try { localStorage.setItem(storageKey, JSON.stringify(ev)); localStorage.removeItem(storageKey); } catch {} },
+    on(cb) { listeners.add(cb); if (ch) ch.onmessage = (e) => { listeners.forEach((l) => l(e.data)); }; return () => listeners.delete(cb); },
+    destroy() { if (typeof window !== "undefined") window.removeEventListener("storage", onStorage); try { ch?.close(); } catch {} },
   };
+;
   if (typeof window !== "undefined") window.addEventListener("storage", onStorage);
 
   return {
@@ -120,11 +150,12 @@ function time() { const d = new Date(); return d.toLocaleTimeString(); }
 
 // -------------------- Root App --------------------
 
-export default function App() {
+export default function QTEApp() {
   /** @type {[Role|null, Function]} */
   const [role, setRole] = useState(null);
   const [name, setName] = useState("");
   const [code, setCode] = useState("");
+  const [relayUrl, setRelayUrl] = useState("");
   /** @type {[LobbyConfig|null, Function]} */
   const [cfg, setCfg] = useState(null);
 
@@ -142,7 +173,7 @@ export default function App() {
   useEffect(() => {
     if (!code) return;
     busRef.current?.destroy?.();
-    const bus = mkBus(code); busRef.current = bus;
+    const bus = mkBus(code, relayUrl); busRef.current = bus;
 
     const unsub = bus.on((ev) => {
       if (ev.type === "CONFIG" && role === "PLAYER") setCfg(ev.config);
@@ -250,7 +281,7 @@ export default function App() {
 
   if (!role) {
     return (
-     <div className="min-h-screen bg-background text-foreground">
+     <div className="min-h-screen flex items-center justify-center bg-slate-100">
         <div className="max-w-xl w-full p-6">
           <motion.h1 initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} className="text-3xl font-bold mb-4">
             CH Quick Time
@@ -264,6 +295,10 @@ export default function App() {
               <div className="grid md:grid-cols-2 gap-4">
                 <div className="border rounded-2xl p-4">
                   <div className="font-medium mb-2">Host</div>
+                  <div className="grid gap-2 mb-2">
+                    <Label className="text-xs">Relay URL (optional)</Label>
+                    <Input value={relayUrl} onChange={(e) => setRelayUrl(e.target.value)} placeholder="wss://your-relay.example/ws" className="mb-1"/>
+                  </div>
                   <Button className="w-full h-12 text-lg" onClick={createLobby}>
                     <Play className="mr-2 h-5 w-5"/>Create lobby
                   </Button>
@@ -274,6 +309,8 @@ export default function App() {
                   <Input value={name} onChange={(e) => setName(e.target.value)} className="mb-2" />
                   <Label className="text-xs">Lobby code</Label>
                   <Input value={code} onChange={(e) => setCode(e.target.value.toUpperCase())} className="uppercase tracking-widest mb-2" />
+                  <Label className="text-xs">Relay URL (optional)</Label>
+                  <Input value={relayUrl} onChange={(e) => setRelayUrl(e.target.value)} placeholder="wss://your-relay.example/ws" className="mb-2"/>
                   <Button className="w-full h-12 text-lg" disabled={!name.trim() || code.length < 3} onClick={joinLobby}>
                     <Users className="mr-2 h-5 w-5"/>Join lobby
                   </Button>
