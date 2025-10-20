@@ -46,10 +46,12 @@ const mkBus = (code, relayUrl) => {
     let ws = null;
     let shouldReconnect = true;
     let backoff = 500;
+    const emitStatus = (state, extra = {}) => listeners.forEach(l => l({ type: "__STATUS__", transport: "ws", room: chanName, state, relayUrl, ...extra }));
+
     const connect = () => {
       try { ws = new WebSocket(`${relayUrl}?room=${encodeURIComponent(chanName)}`); } catch { ws = null; }
       if (!ws) return;
-      ws.onopen = () => { backoff = 500; };
+      ws.onopen = () => { backoff = 500; emitStatus("open"); };
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);
@@ -57,10 +59,11 @@ const mkBus = (code, relayUrl) => {
           if (!msg.room || msg.room === chanName) listeners.forEach((l) => l(ev));
         } catch {}
       };
-      ws.onclose = () => { if (!shouldReconnect) return; setTimeout(connect, Math.min(backoff, 5000)); backoff *= 1.5; };
-      ws.onerror = () => { try { ws.close(); } catch {} };
+      ws.onclose = () => { if (!shouldReconnect) return; emitStatus("closed"); setTimeout(connect, Math.min(backoff, 5000)); backoff *= 1.5; };
+      ws.onerror = () => { emitStatus("error"); try { ws.close(); } catch {} };
     };
     connect();
+
     return {
       post(ev) { try { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ room: chanName, payload: ev })); } catch {} },
       on(cb) { listeners.add(cb); return () => listeners.delete(cb); },
@@ -75,24 +78,12 @@ const mkBus = (code, relayUrl) => {
   const storageKey = `${chanName}-fallback`;
   const onStorage = (e) => { if (e.key === storageKey && e.newValue) { try { const ev = JSON.parse(e.newValue); listeners.forEach((l) => l(ev)); } catch {} } };
   if (typeof window !== "undefined") window.addEventListener("storage", onStorage);
+  // Emit a status event so UI can show transport
+  setTimeout(() => listeners.forEach(l => l({ type: "__STATUS__", transport: ch ? "broadcastchannel" : "storage", room: chanName, state: "open" })), 0);
+
   return {
     post(ev) { ch?.postMessage(ev); try { localStorage.setItem(storageKey, JSON.stringify(ev)); localStorage.removeItem(storageKey); } catch {} },
     on(cb) { listeners.add(cb); if (ch) ch.onmessage = (e) => { listeners.forEach((l) => l(e.data)); }; return () => listeners.delete(cb); },
-    destroy() { if (typeof window !== "undefined") window.removeEventListener("storage", onStorage); try { ch?.close(); } catch {} },
-  };
-;
-  if (typeof window !== "undefined") window.addEventListener("storage", onStorage);
-
-  return {
-    post(ev) {
-      ch?.postMessage(ev);
-      try { localStorage.setItem(storageKey, JSON.stringify(ev)); localStorage.removeItem(storageKey); } catch {}
-    },
-    on(cb) {
-      listeners.add(cb);
-      if (ch) ch.onmessage = (e) => { listeners.forEach((l) => l(e.data)); };
-      return () => listeners.delete(cb);
-    },
     destroy() { if (typeof window !== "undefined") window.removeEventListener("storage", onStorage); try { ch?.close(); } catch {} },
   };
 };
@@ -166,6 +157,7 @@ export default function QTEApp() {
   // Press flash states
   const [hostPressed, setHostPressed] = useState(null); // number|null
   const [playerPressed, setPlayerPressed] = useState(null);
+  const [net, setNet] = useState({ transport: null, state: "", room: "", relayUrl: "" });
 
   const createLobby = () => { const c = randomCode(5); const next = defaultConfig(c); setCfg(next); setCode(c); setRole("HOST"); };
   const joinLobby = () => { if (!code || !name.trim()) return; setRole("PLAYER"); };
@@ -195,6 +187,22 @@ export default function QTEApp() {
     if (role === "PLAYER" && name) bus.post({ type: "HELLO", lobby: code, from: clientId, name });
     return () => { unsub?.(); };
   }, [code, role, name, cfg?.code]);
+
+  // Secondary subscription for network status & ping/pong diagnostics
+  useEffect(() => {
+    const bus = busRef.current; if (!bus) return;
+    const off = bus.on((ev) => {
+      if (ev.type === "__STATUS__") { setNet({ transport: ev.transport, state: ev.state, room: ev.room, relayUrl: ev.relayUrl || relayUrl }); }
+      if (ev.type === "NET_PING" && ev.from !== clientId) {
+        setLog((l)=>[{ line: `${time()} Ping from ${ev.name||ev.from}` }, ...l]);
+        bus.post({ type: "NET_PONG", lobby: code, from: clientId, name, ts: Date.now() });
+      }
+      if (ev.type === "NET_PONG") {
+        setLog((l)=>[{ line: `${time()} Pong from ${ev.name||ev.from}` }, ...l]);
+      }
+    });
+    return () => off?.();
+  }, [code, relayUrl, clientId]);
 
   useEffect(() => { if (role === "HOST" && cfg && busRef.current) busRef.current.post({ type: "CONFIG", lobby: cfg.code, config: cfg }); }, [cfg, role]);
 
@@ -329,6 +337,24 @@ export default function QTEApp() {
           <div className="flex items-center justify-between mb-4">
             <div>
               <div className="text-sm text-slate-500">Lobby code</div>
+              <div className="text-2xl font-bold tracking-widest">{cfg.code}</div>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => setRole(null)}>Exit</Button>
+            </div>
+          </div>
+
+          {/* Connection status */}
+          <div className="mb-3 text-xs text-slate-600 flex items-center gap-3">
+            <span className={`inline-flex items-center gap-1 ${net.state === 'open' ? 'text-green-700' : 'text-red-700'}`}>
+              <span className={`w-2 h-2 rounded-full ${net.state === 'open' ? 'bg-green-500' : 'bg-red-500'}`}></span>
+              {net.transport || 'no-transport'} {net.state || ''}
+            </span>
+            {relayUrl ? <span>relay: <code className="px-1 bg-slate-100 rounded">{relayUrl}</code></span> : <span>relay: (none)</span>}
+            <span>room: <code className="px-1 bg-slate-100 rounded">caveman-qte-{cfg.code}</code></span>
+            <Button size="sm" variant="outline" className="ml-auto" onClick={() => busRef.current?.post({ type: 'NET_PING', lobby: cfg.code, from: clientId, name, ts: Date.now() })}>Ping relay</Button>
+            <Button size="sm" className="" variant="secondary" onClick={() => busRef.current?.post({ type: 'CONFIG', lobby: cfg.code, config: cfg })}>Re-send config</Button>
+          </div>
               <div className="text-2xl font-bold tracking-widest">{cfg.code}</div>
             </div>
             <div className="flex gap-2">
@@ -501,6 +527,19 @@ export default function QTEApp() {
         <div className="max-w-4xl mx-auto p-4 md:p-6">
           <div className="flex items-center justify-between mb-3">
             <div className="text-sm text-slate-400">Lobby {code}</div>
+            <div className="text-sm">You: <span className="font-semibold">{name}</span></div>
+            <Button variant="outline" onClick={() => setRole(null)}>Exit</Button>
+          </div>
+
+          {/* Connection status */}
+          <div className="mb-3 text-[11px] text-slate-400 flex items-center gap-3">
+            <span className={`inline-flex items-center gap-1 ${net.state === 'open' ? 'text-green-300' : 'text-red-300'}`}>
+              <span className={`w-2 h-2 rounded-full ${net.state === 'open' ? 'bg-green-400' : 'bg-red-400'}`}></span>
+              {net.transport || 'no-transport'} {net.state || ''}
+            </span>
+            {relayUrl ? <span>relay: <code className="px-1 bg-slate-800/60 rounded">{relayUrl}</code></span> : <span>relay: (none)</span>}
+            <span>room: <code className="px-1 bg-slate-800/60 rounded">caveman-qte-{code}</code></span>
+          </div>
             <div className="text-sm">You: <span className="font-semibold">{name}</span></div>
             <Button variant="outline" onClick={() => setRole(null)}>Exit</Button>
           </div>
